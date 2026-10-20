@@ -1,0 +1,6 @@
+[2m2026-10-20T09:18:18.437015Z[0m [32m INFO[0m [2mmcp_server_gdb[0m[2m:[0m Starting MCP GDB Server on port 8080
+[2m2026-10-20T09:18:18.444847Z[0m [31mERROR[0m [2mmcp_core::protocol[0m[2m:[0m Error handling notification: invalid type: map, expected unit
+[2m2026-10-20T09:24:22.577489Z[0m [32m INFO[0m [2mmcp_server_gdb[0m[2m:[0m Starting MCP GDB Server on port 8080
+[2m2026-10-20T09:24:22.585122Z[0m [31mERROR[0m [2mmcp_core::protocol[0m[2m:[0m Error handling notification: invalid type: map, expected unit
+[2m2026-10-20T10:15:11.666452Z[0m [32m INFO[0m [2mmcp_server_gdb[0m[2m:[0m Starting MCP GDB Server on port 8080
+[2m2026-10-20T10:15:11.667253Z[0m [31mERROR[0m [2mmcp_core::protocol[0m[2m:[0m Error handling notification: invalid type: map, expected unit

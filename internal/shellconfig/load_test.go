@@ -36,6 +36,36 @@ func TestLoadShellConfig_Provider(t *testing.T) {
 	require.Equal(t, "https://api.openai.com/v1", openai["base_url"])
 }
 
+func TestLoadShellConfig_ProviderRateLimit(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	script := `provider add openai --api-key "key" --rate-limit 120`
+	path := filepath.Join(dir, "crushrc")
+
+	jsonBytes, err := LoadShellConfig(t.Context(), path, []byte(script))
+	require.NoError(t, err)
+
+	var result map[string]any
+	require.NoError(t, json.Unmarshal(jsonBytes, &result))
+
+	openai := result["providers"].(map[string]any)["openai"].(map[string]any)
+	require.Equal(t, float64(120), openai["rate_limit"])
+}
+
+func TestLoadShellConfig_ProviderRateLimitRejectsNonPositive(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"0", "-1", "not-a-number"} {
+		dir := t.TempDir()
+		script := `provider add openai --api-key "key" --rate-limit ` + value
+		path := filepath.Join(dir, "crushrc")
+
+		_, err := LoadShellConfig(t.Context(), path, []byte(script))
+		require.Error(t, err, "rate limit %q should be rejected", value)
+	}
+}
+
 // TestLoadShellConfig_FlagBoolCaseInsensitive verifies that flag booleans
 // accept mixed-case values like TRUE/False.
 func TestLoadShellConfig_FlagBoolCaseInsensitive(t *testing.T) {

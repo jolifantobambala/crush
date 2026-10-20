@@ -41,6 +41,7 @@ import (
 	"github.com/charmbracelet/crush/internal/permission"
 	"github.com/charmbracelet/crush/internal/pubsub"
 	"github.com/charmbracelet/crush/internal/question"
+	"github.com/charmbracelet/crush/internal/ratelimit"
 	"github.com/charmbracelet/crush/internal/session"
 	"github.com/charmbracelet/crush/internal/skills"
 	"golang.org/x/sync/errgroup"
@@ -174,6 +175,10 @@ type coordinator struct {
 	activeSkills []*skills.Skill // Post-filter: active skills only.
 	skillTracker *skills.Tracker
 
+	// rateLimits holds one limiter per provider, shared by every client
+	// built for that provider (large/small models, sub-agents).
+	rateLimits ratelimit.Registry
+
 	readyWg errgroup.Group
 }
 
@@ -225,6 +230,7 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		activeSkills: activeSkills,
 		skillTracker: skillTracker,
 		interactive:  opts.Interactive,
+		rateLimits:   ratelimit.NewRegistry(),
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]
@@ -1076,7 +1082,7 @@ func (c *coordinator) hyperAPIKey() string {
 	return config.ResolveHyperAPIKey(c.cfg.Config())
 }
 
-func (c *coordinator) buildAnthropicProvider(baseURL, apiKey string, headers map[string]string, providerID string) (fantasy.Provider, error) {
+func (c *coordinator) buildAnthropicProvider(baseURL, apiKey string, headers map[string]string, providerID string, rateLimit int) (fantasy.Provider, error) {
 	var opts []anthropic.Option
 
 	switch {
@@ -1101,35 +1107,25 @@ func (c *coordinator) buildAnthropicProvider(baseURL, apiKey string, headers map
 		opts = append(opts, anthropic.WithBaseURL(baseURL))
 	}
 
-	if c.cfg.Config().Options.Debug {
-		httpClient := log.NewHTTPClient()
+	if httpClient := c.providerHTTPClient(nil, providerID, rateLimit); httpClient != nil {
 		opts = append(opts, anthropic.WithHTTPClient(httpClient))
 	}
 	return anthropic.New(opts...)
 }
 
-func (c *coordinator) buildOpenaiProvider(baseURL, apiKey string, headers map[string]string, token *oauth.Token) (fantasy.Provider, error) {
+func (c *coordinator) buildOpenaiProvider(baseURL, apiKey string, headers map[string]string, token *oauth.Token, providerID string, rateLimit int) (fantasy.Provider, error) {
 	opts := []openai.Option{
 		openai.WithAPIKey(apiKey),
 		openai.WithUseResponsesAPI(),
 	}
-	var httpClient *http.Client
-	if c.cfg.Config().Options.Debug {
-		httpClient = log.NewHTTPClient()
-	}
+	// ChatGPT OAuth: requests go through the Codex backend, which
+	// expects account headers and rejects some request fields, so
+	// they pass through the Codex transport.
+	var base http.RoundTripper
 	if token != nil {
-		// ChatGPT OAuth: requests go through the Codex backend, which
-		// expects account headers and rejects some request fields, so
-		// they pass through the Codex transport.
-		if httpClient == nil {
-			httpClient = &http.Client{}
-		}
-		httpClient.Transport = &openaioauth.Transport{
-			Base:  httpClient.Transport,
-			Token: token,
-		}
+		base = &openaioauth.Transport{Token: token}
 	}
-	if httpClient != nil {
+	if httpClient := c.providerHTTPClient(base, providerID, rateLimit); httpClient != nil {
 		opts = append(opts, openai.WithHTTPClient(httpClient))
 	}
 	if len(headers) > 0 {
@@ -1141,12 +1137,11 @@ func (c *coordinator) buildOpenaiProvider(baseURL, apiKey string, headers map[st
 	return openai.New(opts...)
 }
 
-func (c *coordinator) buildOpenrouterProvider(_, apiKey string, headers map[string]string) (fantasy.Provider, error) {
+func (c *coordinator) buildOpenrouterProvider(_, apiKey string, headers map[string]string, providerID string, rateLimit int) (fantasy.Provider, error) {
 	opts := []openrouter.Option{
 		openrouter.WithAPIKey(apiKey),
 	}
-	if c.cfg.Config().Options.Debug {
-		httpClient := log.NewHTTPClient()
+	if httpClient := c.providerHTTPClient(nil, providerID, rateLimit); httpClient != nil {
 		opts = append(opts, openrouter.WithHTTPClient(httpClient))
 	}
 	if len(headers) > 0 {
@@ -1155,12 +1150,11 @@ func (c *coordinator) buildOpenrouterProvider(_, apiKey string, headers map[stri
 	return openrouter.New(opts...)
 }
 
-func (c *coordinator) buildVercelProvider(_, apiKey string, headers map[string]string) (fantasy.Provider, error) {
+func (c *coordinator) buildVercelProvider(_, apiKey string, headers map[string]string, providerID string, rateLimit int) (fantasy.Provider, error) {
 	opts := []vercel.Option{
 		vercel.WithAPIKey(apiKey),
 	}
-	if c.cfg.Config().Options.Debug {
-		httpClient := log.NewHTTPClient()
+	if httpClient := c.providerHTTPClient(nil, providerID, rateLimit); httpClient != nil {
 		opts = append(opts, vercel.WithHTTPClient(httpClient))
 	}
 	if len(headers) > 0 {
@@ -1169,13 +1163,14 @@ func (c *coordinator) buildVercelProvider(_, apiKey string, headers map[string]s
 	return vercel.New(opts...)
 }
 
-func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers map[string]string, extraBody map[string]any, providerID string, isSubAgent bool) (fantasy.Provider, error) {
+func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers map[string]string, extraBody map[string]any, providerID string, isSubAgent bool, rateLimit int) (fantasy.Provider, error) {
 	opts := []openaicompat.Option{
 		openaicompat.WithBaseURL(baseURL),
 		openaicompat.WithAPIKey(apiKey),
 	}
 
-	// Set HTTP client based on provider and debug mode.
+	// Set the HTTP client based on the provider, rate limit, and debug
+	// mode.
 	var httpClient *http.Client
 	switch providerID {
 	case string(catwalk.InferenceProviderCopilot):
@@ -1187,6 +1182,7 @@ func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers 
 			}),
 		)
 		httpClient = copilot.NewClient(isSubAgent, c.cfg.Config().Options.Debug)
+		httpClient.Transport = c.wrapRateLimit(httpClient.Transport, providerID, rateLimit)
 
 	case string(catwalk.InferenceProviderOpenCodeGo), string(catwalk.InferenceProviderOpenCodeZen):
 		opts = append(
@@ -1205,8 +1201,8 @@ func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers 
 			),
 		)
 	}
-	if httpClient == nil && c.cfg.Config().Options.Debug {
-		httpClient = log.NewHTTPClient()
+	if httpClient == nil {
+		httpClient = c.providerHTTPClient(nil, providerID, rateLimit)
 	}
 	if httpClient != nil {
 		opts = append(opts, openaicompat.WithHTTPClient(httpClient))
@@ -1223,14 +1219,13 @@ func (c *coordinator) buildOpenaiCompatProvider(baseURL, apiKey string, headers 
 	return openaicompat.New(opts...)
 }
 
-func (c *coordinator) buildAzureProvider(baseURL, apiKey string, headers map[string]string, options map[string]string) (fantasy.Provider, error) {
+func (c *coordinator) buildAzureProvider(baseURL, apiKey string, headers map[string]string, options map[string]string, providerID string, rateLimit int) (fantasy.Provider, error) {
 	opts := []azure.Option{
 		azure.WithBaseURL(baseURL),
 		azure.WithAPIKey(apiKey),
 		azure.WithUseResponsesAPI(),
 	}
-	if c.cfg.Config().Options.Debug {
-		httpClient := log.NewHTTPClient()
+	if httpClient := c.providerHTTPClient(nil, providerID, rateLimit); httpClient != nil {
 		opts = append(opts, azure.WithHTTPClient(httpClient))
 	}
 	if options == nil {
@@ -1246,10 +1241,9 @@ func (c *coordinator) buildAzureProvider(baseURL, apiKey string, headers map[str
 	return azure.New(opts...)
 }
 
-func (c *coordinator) buildBedrockProvider(apiKey string, headers map[string]string, providerID string) (fantasy.Provider, error) {
+func (c *coordinator) buildBedrockProvider(apiKey string, headers map[string]string, providerID string, rateLimit int) (fantasy.Provider, error) {
 	var opts []bedrock.Option
-	if c.cfg.Config().Options.Debug {
-		httpClient := log.NewHTTPClient()
+	if httpClient := c.providerHTTPClient(nil, providerID, rateLimit); httpClient != nil {
 		opts = append(opts, bedrock.WithHTTPClient(httpClient))
 	}
 	if len(headers) > 0 {
@@ -1275,13 +1269,12 @@ func (c *coordinator) buildBedrockProvider(apiKey string, headers map[string]str
 	return bedrock.New(opts...)
 }
 
-func (c *coordinator) buildGoogleProvider(baseURL, apiKey string, headers map[string]string) (fantasy.Provider, error) {
+func (c *coordinator) buildGoogleProvider(baseURL, apiKey string, headers map[string]string, providerID string, rateLimit int) (fantasy.Provider, error) {
 	opts := []google.Option{
 		google.WithBaseURL(baseURL),
 		google.WithGeminiAPIKey(apiKey),
 	}
-	if c.cfg.Config().Options.Debug {
-		httpClient := log.NewHTTPClient()
+	if httpClient := c.providerHTTPClient(nil, providerID, rateLimit); httpClient != nil {
 		opts = append(opts, google.WithHTTPClient(httpClient))
 	}
 	if len(headers) > 0 {
@@ -1290,10 +1283,9 @@ func (c *coordinator) buildGoogleProvider(baseURL, apiKey string, headers map[st
 	return google.New(opts...)
 }
 
-func (c *coordinator) buildGoogleVertexProvider(headers map[string]string, options map[string]string) (fantasy.Provider, error) {
+func (c *coordinator) buildGoogleVertexProvider(headers map[string]string, options map[string]string, providerID string, rateLimit int) (fantasy.Provider, error) {
 	opts := []google.Option{}
-	if c.cfg.Config().Options.Debug {
-		httpClient := log.NewHTTPClient()
+	if httpClient := c.providerHTTPClient(nil, providerID, rateLimit); httpClient != nil {
 		opts = append(opts, google.WithHTTPClient(httpClient))
 	}
 	if len(headers) > 0 {
@@ -1316,6 +1308,39 @@ func (c *coordinator) isAnthropicThinking(model config.SelectedModel) bool {
 	return err == nil && opts.Thinking != nil
 }
 
+// providerHTTPClient returns the HTTP client used for a provider's API
+// requests. base is the transport to wrap (nil means the default transport),
+// and the client carries the provider's configured rate limit plus request
+// logging in debug mode. It returns nil when there is nothing to wrap, letting
+// the SDK use its own default client.
+func (c *coordinator) providerHTTPClient(base http.RoundTripper, providerID string, rateLimit int) *http.Client {
+	debug := c.cfg.Config().Options.Debug
+	limiter := c.rateLimits.Limiter(providerID, rateLimit)
+	if !debug && limiter == nil && base == nil {
+		return nil
+	}
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if debug {
+		base = &log.HTTPRoundTripLogger{Transport: base}
+	}
+	if limiter != nil {
+		base = &ratelimit.Transport{Base: base, Limiter: limiter}
+	}
+	return &http.Client{Transport: base}
+}
+
+// wrapRateLimit wraps base with the provider's shared rate limiter, if any.
+// It returns base unchanged when no limit is configured.
+func (c *coordinator) wrapRateLimit(base http.RoundTripper, providerID string, rateLimit int) http.RoundTripper {
+	limiter := c.rateLimits.Limiter(providerID, rateLimit)
+	if limiter == nil {
+		return base
+	}
+	return &ratelimit.Transport{Base: base, Limiter: limiter}
+}
+
 func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model config.SelectedModel, isSubAgent bool) (fantasy.Provider, error) {
 	headers := maps.Clone(providerCfg.ExtraHeaders)
 	if headers == nil {
@@ -1333,12 +1358,13 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 
 	apiKey, _ := c.cfg.Resolve(providerCfg.APIKey)
 	baseURL, _ := c.cfg.Resolve(providerCfg.BaseURL)
+	rateLimit := providerCfg.RateLimit
 
 	switch providerCfg.ID {
 	case string(catwalk.InferenceProviderOpenCodeGo), string(catwalk.InferenceProviderOpenCodeZen):
 		if isOpenCodeMessagesModel(providerCfg.ID, model.Model) {
 			baseURL = strings.TrimSuffix(baseURL, "/v1")
-			return c.buildAnthropicProvider(baseURL, apiKey, headers, providerCfg.ID)
+			return c.buildAnthropicProvider(baseURL, apiKey, headers, providerCfg.ID, rateLimit)
 		}
 	}
 
@@ -1355,21 +1381,21 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 				headers["chatgpt-account-id"] = token.AccountID
 			}
 		}
-		return c.buildOpenaiProvider(baseURL, apiKey, headers, token)
+		return c.buildOpenaiProvider(baseURL, apiKey, headers, token, providerCfg.ID, rateLimit)
 	case anthropic.Name:
-		return c.buildAnthropicProvider(baseURL, apiKey, headers, providerCfg.ID)
+		return c.buildAnthropicProvider(baseURL, apiKey, headers, providerCfg.ID, rateLimit)
 	case openrouter.Name:
-		return c.buildOpenrouterProvider(baseURL, apiKey, headers)
+		return c.buildOpenrouterProvider(baseURL, apiKey, headers, providerCfg.ID, rateLimit)
 	case vercel.Name:
-		return c.buildVercelProvider(baseURL, apiKey, headers)
+		return c.buildVercelProvider(baseURL, apiKey, headers, providerCfg.ID, rateLimit)
 	case azure.Name:
-		return c.buildAzureProvider(baseURL, apiKey, headers, providerCfg.ExtraParams)
+		return c.buildAzureProvider(baseURL, apiKey, headers, providerCfg.ExtraParams, providerCfg.ID, rateLimit)
 	case bedrock.Name:
-		return c.buildBedrockProvider(apiKey, headers, providerCfg.ID)
+		return c.buildBedrockProvider(apiKey, headers, providerCfg.ID, rateLimit)
 	case google.Name:
-		return c.buildGoogleProvider(baseURL, apiKey, headers)
+		return c.buildGoogleProvider(baseURL, apiKey, headers, providerCfg.ID, rateLimit)
 	case "google-vertex":
-		return c.buildGoogleVertexProvider(headers, providerCfg.ExtraParams)
+		return c.buildGoogleVertexProvider(headers, providerCfg.ExtraParams, providerCfg.ID, rateLimit)
 	case openaicompat.Name, hyper.Name:
 		switch providerCfg.ID {
 		case hyper.Name:
@@ -1381,12 +1407,12 @@ func (c *coordinator) buildProvider(providerCfg config.ProviderConfig, model con
 			}
 			providerCfg.ExtraBody["tool_stream"] = true
 		}
-		return c.buildOpenaiCompatProvider(baseURL, apiKey, headers, providerCfg.ExtraBody, providerCfg.ID, isSubAgent)
+		return c.buildOpenaiCompatProvider(baseURL, apiKey, headers, providerCfg.ExtraBody, providerCfg.ID, isSubAgent, rateLimit)
 	default:
 		// Known custom providers (litellm, llamacpp, lmstudio, ollama,
 		// omlx) are openai-compat under the hood.
 		if discover.IsKnownCustomProvider(string(providerCfg.Type)) {
-			return c.buildOpenaiCompatProvider(baseURL, apiKey, headers, providerCfg.ExtraBody, providerCfg.ID, isSubAgent)
+			return c.buildOpenaiCompatProvider(baseURL, apiKey, headers, providerCfg.ExtraBody, providerCfg.ID, isSubAgent, rateLimit)
 		}
 		return nil, fmt.Errorf("provider type not supported: %q", providerCfg.Type)
 	}

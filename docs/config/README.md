@@ -154,6 +154,7 @@ Flags:
       --base-url string             API base URL
       --disable bool                disable without removing
       --flat-rate bool              use flat-rate billing
+      --rate-limit int              max requests per minute (unset means unlimited)
       --discover-models bool        auto-discover and merge provider models
       --system-prompt-prefix string text prepended to the system prompt
       --extra-header key value      add an HTTP header (repeatable)
@@ -167,6 +168,11 @@ provider add deepseek \
   --base-url "https://api.deepseek.com/v1" \
   --api-key "${DEEPSEEK_API_KEY:?set DEEPSEEK_API_KEY}"
 ```
+
+`--rate-limit` caps outbound model requests to the provider in requests per
+minute, shared by every model, session, and sub-agent using that provider.
+Requests are paced evenly, so `--rate-limit 60` allows one request per second;
+retries count against the limit. Leave the flag out for no limit.
 
 Headers whose value resolves to the empty string (an unset `$VAR`, a
 `$(...)` that prints nothing, or a literal `""`) are dropped from the

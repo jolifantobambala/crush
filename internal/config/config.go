@@ -139,6 +139,11 @@ type ProviderConfig struct {
 	// Skip cost accumulation for this provider when using subscription or flat rate billing.
 	FlatRate bool `json:"flat_rate,omitempty" jsonschema:"description=Flat-rate mode for this provider"`
 
+	// RateLimit caps requests to this provider's API, in requests per
+	// minute. Zero means no limit. Requests are paced evenly, so a limit
+	// of 60 allows one request per second.
+	RateLimit int `json:"rate_limit,omitempty" jsonschema:"description=Maximum requests per minute to this provider's API; unset means unlimited,example=60"`
+
 	// AutoDiscoverModels controls model discovery via /v1/models endpoint.
 	// When Models is empty and this is nil or true, Crush auto-discovers
 	// models. When true and Models is non-empty, discovered models are

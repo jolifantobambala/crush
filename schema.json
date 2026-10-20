@@ -772,6 +772,13 @@
           "type": "boolean",
           "description": "Flat-rate mode for this provider"
         },
+        "rate_limit": {
+          "type": "integer",
+          "description": "Maximum requests per minute to this provider's API; unset means unlimited",
+          "examples": [
+            60
+          ]
+        },
         "discover_models": {
           "type": "boolean",
           "description": "Auto-discover models from /v1/models endpoint. When true with existing models they are merged (yours win)",

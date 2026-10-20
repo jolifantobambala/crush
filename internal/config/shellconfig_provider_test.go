@@ -14,6 +14,7 @@ func TestShellConfigProviderAddAndModel(t *testing.T) {
   --type openai-compat \
   --base-url "http://localhost:1234/v1" \
   --api-key "sk-test" \
+  --rate-limit 120 \
   --discover-models false \
   --extra-body '{"service_tier":"flex"}' \
   --provider-options '{"region":"local"}'
@@ -37,6 +38,7 @@ model large myllm/foo-1 --provider-options '{"timeout":30}'`)
 	require.Equal(t, "http://localhost:1234/v1", p.BaseURL)
 	require.NotNil(t, p.AutoDiscoverModels)
 	require.False(t, *p.AutoDiscoverModels)
+	require.Equal(t, 120, p.RateLimit)
 	require.Equal(t, "flex", p.ExtraBody["service_tier"])
 	require.Equal(t, true, p.ExtraBody["stream"])
 	require.Equal(t, "local", p.ProviderOptions["region"])
